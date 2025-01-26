@@ -31,14 +31,18 @@ from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
+# these are set to values for shakespeare_char dataset, becuase my GPU is too slow
 # I/O
 out_dir = 'out'
-eval_interval = 200  # much more often becuase of my slow GPU!
+save_initial = False
+eval_interval = 10  # much more often becuase of my slow GPU!
 log_interval = 1
-eval_iters = 200
+eval_iters = 1
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'resume' # 'scratch' (CAREFUL - checkpoints are overwritten) or 'resume' or 'gpt2*'
+inspect_grads = False
+base_seed = 1337 # base seed for everything - adjusted by offset for each GPU in DDP
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -56,7 +60,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 2000 # for shakespeare - # 600000 # for OpenWebText - (not on my slow sys) total number of training iterations
+max_iters = 400 # 2000 for shakespeare - # 600000 # for OpenWebText - (not on my slow sys) total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -108,7 +112,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(base_seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -138,7 +142,7 @@ def get_batch(split):
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
+iter_num = initial_iter = 0
 best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
@@ -163,7 +167,7 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+    print(f"Resuming training from {out_dir}/ckpt.pt")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -183,7 +187,7 @@ elif init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
+    iter_num = initial_iter = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
@@ -214,6 +218,8 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
+count_dict = {}  # initialize the dictionary used to count the number of times a weight is updated
+
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -240,7 +246,7 @@ def get_lr(it):
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
+    if it >= lr_decay_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
@@ -270,7 +276,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if save_initial or (iter_num % eval_interval == 0 and master_process):
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -283,7 +289,7 @@ while True:
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
-            if iter_num > 0:
+            if save_initial or (iter_num > 0):
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -294,7 +300,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
+    if save_initial or (iter_num == 0 and eval_only):
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -313,6 +319,16 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+
+        if inspect_grads:
+            for name, param in model.named_parameters():
+                if 'weight' in name and param.grad is not None:
+                    if iter_num == initial_iter:
+                        count_dict[name] = torch.zeros(param.grad.shape, device=param.device)
+                    temp = torch.zeros(param.grad.shape, device=param.device)
+                    temp[param.grad != 0] += 1
+                    count_dict[name] += temp
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
